@@ -249,7 +249,10 @@ def categorize_price_range(price):
 
 def prepare_trade_analysis(df):
     """
-    Prepare trade analysis by carefully matching buy and sell orders
+    LEGACY: Prepare trade analysis by matching buy and sell orders using the original algorithm
+    
+    NOTE: This function is kept for backward compatibility but may not handle
+    complex trading patterns correctly. Use prepare_trade_analysis_enhanced instead.
     
     Args:
         df (pd.DataFrame): Processed trading dataframe
@@ -372,6 +375,203 @@ def prepare_trade_analysis(df):
     
     return result_df
 
+def prepare_trade_analysis_enhanced(df):
+    """
+    Enhanced trade analysis to handle complex buy-sell patterns including partial positions
+    
+    This function handles:
+    - 1 buy (full position) 1 sell (full position)
+    - 1 buy (full position) 2 sells (2 half positions)
+    - 2 buys (half and half) 1 sell
+    - 1 buy (full) 1 sell (half) 1 buy 1 sell (half) 1 buy 1 sell (full)
+    
+    Args:
+        df (pd.DataFrame): Processed trading dataframe
+    
+    Returns:
+        pd.DataFrame: Trade analysis dataframe
+    """
+    # Check if input has already pre-calculated P&L data (Rachel's format)
+    if 'Gain/Loss' in df.columns and 'Profit or Loss' in df.columns:
+        return prepare_trade_analysis_from_rachel(df)
+    
+    # Sort dataframe by symbol, date and time to ensure chronological processing
+    # Make sure datetime is used for sorting to handle intraday timing correctly
+    df_sorted = df.sort_values(['Symbol', 'DateTime']).copy()
+    
+    # Initialize trade analysis list
+    trade_analysis = []
+    
+    # Initialize position tracker dictionary by symbol
+    positions = {}
+    
+    # Debug flag for troubleshooting specific symbols
+    debug_mode = False
+    debug_symbols = ['HIMS']  # Add symbols to debug here
+    
+    # For debugging
+    def debug_print(symbol, message):
+        if debug_mode and symbol in debug_symbols:
+            print(f"DEBUG [{symbol}]: {message}")
+    
+    # Process orders chronologically
+    for idx, row in df_sorted.iterrows():
+        symbol = row['Symbol']
+        side = row['Side']
+        date = row['Date']
+        qty = row['Filled']
+        price = row['Avg Price']
+        timestamp = row['DateTime']
+        
+        # Skip non-filled orders
+        if row['Status'] != 'Filled':
+            continue
+        
+        # Initialize position tracking for this symbol if not exists
+        if symbol not in positions:
+            positions[symbol] = {
+                'position': 0,
+                'buys': [],
+                'partial_sells': []
+            }
+        
+        position_data = positions[symbol]
+        
+        debug_print(symbol, f"Processing {side} order for {qty} shares at ${price} at {timestamp}")
+        debug_print(symbol, f"Before: Position={position_data['position']}, Buys={[(b['qty'], b['price']) for b in position_data['buys']]}")
+        
+        # Handle Buy order
+        if side == 'Buy':
+            # Add to current position
+            position_data['position'] += qty
+            
+            # Store buy information with complete row data
+            position_data['buys'].append({
+                'qty': qty,
+                'price': price,
+                'date': date,
+                'timestamp': timestamp,
+                'row_data': row.to_dict()
+            })
+            
+            debug_print(symbol, f"After Buy: Position={position_data['position']}, Buys={[(b['qty'], b['price']) for b in position_data['buys']]}")
+        
+        # Handle Sell order
+        elif side == 'Sell':
+            # Skip if no position to sell
+            if position_data['position'] <= 0:
+                debug_print(symbol, f"Skipping sell - no position available")
+                continue
+                
+            # Determine actual sell quantity (can't sell more than position)
+            actual_sell_qty = min(qty, position_data['position'])
+            
+            # Update remaining position
+            position_data['position'] -= actual_sell_qty
+            
+            # Track this sell order
+            position_data['partial_sells'].append({
+                'sell_qty': actual_sell_qty,
+                'sell_price': price,
+                'sell_date': date,
+                'sell_timestamp': timestamp,
+                'sell_row_data': row.to_dict()
+            })
+            
+            debug_print(symbol, f"Sell order: {actual_sell_qty} shares at ${price}")
+            
+            # Process completed trades while we have sells to allocate
+            remaining_sell_qty = actual_sell_qty
+            
+            # Process buys from oldest to newest (FIFO - First In, First Out)
+            while remaining_sell_qty > 0 and position_data['buys']:
+                oldest_buy = position_data['buys'][0]
+                
+                # Calculate how much of this buy can be sold
+                match_qty = min(oldest_buy['qty'], remaining_sell_qty)
+                
+                debug_print(symbol, f"Matching {match_qty} shares from buy at ${oldest_buy['price']}")
+                
+                # Update remaining quantities
+                oldest_buy['qty'] -= match_qty
+                remaining_sell_qty -= match_qty
+                
+                # Generate trade entry
+                buy_price = oldest_buy['price']
+                weighted_sell_price = price  # Using current sell price
+                
+                # Calculate trade performance
+                total_cost = match_qty * buy_price
+                total_revenue = match_qty * weighted_sell_price
+                total_profit_loss = total_revenue - total_cost
+                pnl_per_share = weighted_sell_price - buy_price
+                
+                # Calculate percent gain/loss safely
+                try:
+                    percent_gain_loss = (total_profit_loss / total_cost) * 100 if total_cost != 0 else 0
+                except Exception:
+                    percent_gain_loss = 0
+                
+                # Determine trade outcome
+                trade_outcome = 'Win' if total_profit_loss > 0 else 'Loss' if total_profit_loss < 0 else 'Break Even'
+                
+                # Get buy data
+                buy_row_data = oldest_buy['row_data']
+                
+                # For some fields, fallback to safe defaults if data is missing
+                price_range = buy_row_data.get('Price_Range', 'Unknown')
+                if price_range == 'Unknown' and isinstance(buy_price, (int, float)):
+                    price_range = categorize_price_range(buy_price)
+                
+                # Construct trade entry with detailed information
+                trade_entry = {
+                    'Symbol': symbol,
+                    'Buy_Quantity': match_qty,
+                    'Sell_Quantity': match_qty,
+                    'Avg_Buy_Price': buy_price,
+                    'Avg_Sell_Price': weighted_sell_price,
+                    'PnL_Per_Share': pnl_per_share,
+                    'Total_Cost': total_cost,
+                    'Total_Revenue': total_revenue,
+                    'Total_Profit_Loss': total_profit_loss,
+                    'Percent_Gain_Loss': percent_gain_loss,
+                    'PnL_%': percent_gain_loss,
+                    'Trade_Outcome': trade_outcome,
+                    'Price_Range': price_range,
+                    'Market_Hour_Category': buy_row_data.get('Market_Hour_Category', 'Unknown'),
+                    'Year': buy_row_data.get('Year', date.year if hasattr(date, 'year') else None),
+                    'Month': buy_row_data.get('Month', None),
+                    'Day_of_Week': buy_row_data.get('Day_of_Week', None),
+                    'Date': date,
+                    'DateTime': buy_row_data.get('DateTime', None),
+                    'Buy_Time': oldest_buy['timestamp'],
+                    'Sell_Time': timestamp
+                }
+                
+                debug_print(symbol, f"Created trade entry: {match_qty} shares, P&L: ${total_profit_loss:.2f}, {percent_gain_loss:.2f}%")
+                
+                trade_analysis.append(trade_entry)
+                
+                # If buy is fully matched, remove it from the list
+                if oldest_buy['qty'] <= 0:
+                    position_data['buys'].pop(0)
+                    debug_print(symbol, f"Removed fully matched buy")
+            
+            debug_print(symbol, f"After Sell: Position={position_data['position']}, Buys={[(b['qty'], b['price']) for b in position_data['buys']]}")
+    
+    # Create dataframe from trade analysis list
+    result_df = pd.DataFrame(trade_analysis)
+    
+    # If DataFrame is empty, return an empty DataFrame with the expected columns
+    if result_df.empty:
+        columns = ['Symbol', 'Buy_Quantity', 'Sell_Quantity', 'Avg_Buy_Price', 'Avg_Sell_Price',
+                  'PnL_Per_Share', 'Total_Cost', 'Total_Revenue', 'Total_Profit_Loss',
+                  'Percent_Gain_Loss', 'PnL_%', 'Trade_Outcome', 'Price_Range',
+                  'Market_Hour_Category', 'Year', 'Month', 'Day_of_Week', 'Date', 'DateTime']
+        return pd.DataFrame(columns=columns)
+    
+    return result_df
+
 def prepare_trade_analysis_from_rachel(df):
     """
     Prepare trade analysis from Rachel's Trading Log format
@@ -392,7 +592,7 @@ def prepare_trade_analysis_from_rachel(df):
     # Iterate through buy orders
     for _, buy_row in buy_orders.iterrows():
         # Skip rows with no P&L data
-        if pd.isna(buy_row['Gain/Loss']):
+        if pd.isna(buy_row.get('Gain/Loss')):
             continue
             
         # Calculate quantities from the data we have
