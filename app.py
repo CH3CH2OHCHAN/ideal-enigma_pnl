@@ -4,7 +4,7 @@ import io
 
 
 # Import custom modules
-from src.data_processor import load_trading_data_from_bytes, prepare_trade_analysis
+from src.data_processor import load_trading_data_from_bytes, prepare_trade_analysis_enhanced
 from src.performance_analysis import (
     calculate_overall_performance, 
     performance_by_dimension, 
@@ -51,8 +51,8 @@ def main():
             # Add sidebar filters
             st.sidebar.header("Filter Options")
             
-            # Prepare trade analysis first to ensure Percent_Gain_Loss is calculated
-            full_trade_analysis_df = prepare_trade_analysis(raw_df)
+            # Prepare trade analysis using the enhanced algorithm
+            full_trade_analysis_df = prepare_trade_analysis_enhanced(raw_df)
             
             # Date Range Filter
             min_date = full_trade_analysis_df['DateTime'].min().date()
